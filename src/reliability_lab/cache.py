@@ -4,6 +4,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass
+from math import sqrt
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -11,9 +12,11 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 PRIVACY_PATTERNS = re.compile(
-    r"\b(balance|password|credit.card|ssn|social.security|user.\d+|account.\d+)\b",
+    r"\b(balance|password|credit.card|ssn|social.security|user\s*\d+|account\s*\d+)\b",
     re.IGNORECASE,
 )
+
+TOKEN_PATTERN = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 
 
 def _is_uncacheable(query: str) -> bool:
@@ -55,7 +58,10 @@ class ResponseCache:
         self._entries: list[CacheEntry] = []
 
     def get(self, query: str) -> tuple[str | None, float]:
+        if _is_uncacheable(query):
+            return None, 0.0
         best_value: str | None = None
+        best_key: str | None = None
         best_score = 0.0
         now = time.time()
         self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
@@ -64,24 +70,56 @@ class ResponseCache:
             if score > best_score:
                 best_score = score
                 best_value = entry.value
+                best_key = entry.key
+        if best_key is not None and _looks_like_false_hit(query, best_key):
+            return None, best_score
         if best_score >= self.similarity_threshold:
             return best_value, best_score
         return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
+        if _is_uncacheable(query):
+            return
         self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
 
     @staticmethod
     def similarity(a: str, b: str) -> float:
-        """Very small baseline similarity using token overlap.
-
-        TODO(student): Improve with embeddings or a deterministic vectorizer.
-        """
-        left = set(a.lower().split())
-        right = set(b.lower().split())
-        if not left or not right:
+        """Deterministic semantic-ish similarity using tokens and character n-grams."""
+        a_norm = " ".join(TOKEN_PATTERN.findall(a.lower()))
+        b_norm = " ".join(TOKEN_PATTERN.findall(b.lower()))
+        if not a_norm or not b_norm:
             return 0.0
-        return len(left & right) / len(left | right)
+        if a_norm == b_norm:
+            return 1.0
+
+        left_tokens = frozenset(a_norm.split())
+        right_tokens = frozenset(b_norm.split())
+        token_score = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+        left_grams = ResponseCache._char_ngrams(a_norm)
+        right_grams = ResponseCache._char_ngrams(b_norm)
+        char_score = len(left_grams & right_grams) / len(left_grams | right_grams) if left_grams and right_grams else 0.0
+
+        left_vec = {token: a_norm.split().count(token) for token in left_tokens}
+        right_vec = {token: b_norm.split().count(token) for token in right_tokens}
+        cosine_score = ResponseCache._cosine(left_vec, right_vec)
+        return max(token_score, (char_score * 0.35) + (cosine_score * 0.65))
+
+    @staticmethod
+    def _char_ngrams(text: str, n: int = 4) -> frozenset[str]:
+        if len(text) <= n:
+            return frozenset({text})
+        return frozenset(text[i : i + n] for i in range(len(text) - n + 1))
+
+    @staticmethod
+    def _cosine(left: dict[str, int], right: dict[str, int]) -> float:
+        common = set(left) & set(right)
+        dot = sum(left[token] * right[token] for token in common)
+        left_norm = sqrt(sum(value * value for value in left.values()))
+        right_norm = sqrt(sum(value * value for value in right.values()))
+        if not left_norm or not right_norm:
+            return 0.0
+        return dot / (left_norm * right_norm)
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +184,36 @@ class SharedRedisCache:
         7. Before returning a match, check _looks_like_false_hit(); if true,
            append to self.false_hit_log and return (None, best_score)
         """
-        return None, 0.0
+        if _is_uncacheable(query):
+            return None, 0.0
+        try:
+            exact_key = f"{self.prefix}{self._query_hash(query)}"
+            exact_response = self._redis.hget(exact_key, "response")
+            if exact_response is not None:
+                return str(exact_response), 1.0
+
+            best_response: str | None = None
+            best_query: str | None = None
+            best_score = 0.0
+            for key in self._redis.scan_iter(f"{self.prefix}*"):
+                cached_query = self._redis.hget(key, "query")
+                if not cached_query:
+                    continue
+                score = ResponseCache.similarity(query, str(cached_query))
+                if score > best_score:
+                    best_score = score
+                    best_query = str(cached_query)
+                    response = self._redis.hget(key, "response")
+                    best_response = str(response) if response is not None else None
+
+            if best_query is not None and _looks_like_false_hit(query, best_query):
+                self.false_hit_log.append({"query": query, "cached_query": best_query, "score": best_score})
+                return None, best_score
+            if best_response is not None and best_score >= self.similarity_threshold:
+                return best_response, best_score
+            return None, best_score
+        except Exception:
+            return None, 0.0
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
@@ -157,7 +224,17 @@ class SharedRedisCache:
         3. self._redis.hset(key, mapping={"query": query, "response": value})
         4. self._redis.expire(key, self.ttl_seconds)
         """
-        pass
+        if _is_uncacheable(query):
+            return
+        try:
+            key = f"{self.prefix}{self._query_hash(query)}"
+            mapping = {"query": query, "response": value}
+            if metadata:
+                mapping.update({f"meta:{k}": v for k, v in metadata.items()})
+            self._redis.hset(key, mapping=mapping)
+            self._redis.expire(key, self.ttl_seconds)
+        except Exception:
+            return
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""
